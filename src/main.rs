@@ -1,6 +1,8 @@
 use differential_dataflow::input::InputSession;
+use differential_dataflow::operators::Count;
 use differential_dataflow::operators::JoinCore;
 use differential_dataflow::operators::Reduce;
+use differential_dataflow::operators::Threshold;
 use differential_dataflow::operators::arrange::arrangement::ArrangeByKey;
 use serde::{Deserialize, Serialize};
 use std::cmp::max;
@@ -219,6 +221,33 @@ fn cell_ancestors(cell: CellKey) -> Vec<CellKey> {
     ancestors
 }
 
+fn cell_distance_bounds(query_point: (i64, i64), cell: CellKey) -> (i64, i64) {
+    let cell_rect = cell_rect(cell.level, cell.x, cell.y);
+
+    // Minimum distance (0 if point is inside cell)
+    let min_dist_sq = point_to_rect_distance_squared(query_point, &cell_rect);
+
+    // Maximum distance (to farthest corner)
+    let corners = [
+        (cell_rect.min_x, cell_rect.min_y),
+        (cell_rect.min_x, cell_rect.max_y),
+        (cell_rect.max_x, cell_rect.min_y),
+        (cell_rect.max_x, cell_rect.max_y),
+    ];
+
+    let max_dist_sq = corners
+        .iter()
+        .map(|&corner| {
+            let dx = query_point.0 - corner.0;
+            let dy = query_point.1 - corner.1;
+            dx * dx + dy * dy
+        })
+        .max()
+        .unwrap();
+
+    (min_dist_sq, max_dist_sq)
+}
+
 type ObjectId = u64;
 type QueryId = u64;
 
@@ -238,6 +267,10 @@ fn main() {
                 cells.into_iter().map(move |cell| (cell, (object_id, rect)))
             });
 
+            covered.map(|_| ()).count().inspect(|count| {
+                println!("Covered collection size: {:?} records", count.0);
+            });
+
             let by_cell = covered.arrange_by_key();
 
             let query_cells = query_collection.flat_map(|(query_id, rect)| {
@@ -247,12 +280,20 @@ fn main() {
                     .map(move |cell| (cell, (query_id, rect)))
             });
 
+            query_cells.map(|_| ()).count().inspect(|count| {
+                println!("Query cells size: {:?} records", count.0);
+            });
+
             let candidates = query_cells.join_core(
                 &by_cell,
                 |_k, (query_id, query_rect), (object_id, object_rect)| {
                     Some((*query_id, *query_rect, *object_id, *object_rect))
                 },
             );
+
+            candidates.map(|_| ()).count().inspect(|count| {
+                println!("Candidate cells size: {:?} records", count.0);
+            });
 
             let hits = candidates
                 .filter(|(_query_id, query_rect, _object_id, object_rect)| {
@@ -264,26 +305,92 @@ fn main() {
                 println!("Hit: query_id={}, object_id={}", hit.0.0, hit.0.1);
             });
 
-            // This kinda sucks because it uses a Queries * Objects memory.
-            // A better approach would be to use the dyadic cells directly to limit the search space.
-            // Pick an arbitary radius around the query point, and find the dyadic cells that intersect it.
-            // Then find the objects that intersect those cells. We can iteratively expand the search radius.
-            // Until we find enough objects or reach a max radius.
-            // Right now, we compute the cross product of queries and objects, and compute the distances for all pairs.
-            // Then we can reduce to find the top-k closest objects for each query.
+            let cell_distances = knn_query_collection
+                .map(|(query_id, point, k)| ((), (query_id, point, k)))
+                .join_core(
+                    &covered
+                        .map(|(cell, _objects)| ((), cell))
+                        .distinct()
+                        .arrange_by_key(),
+                    |_key, (query_id, point, k), cell| {
+                        let (min_dist_sq, max_dist_sq) = cell_distance_bounds(*point, *cell);
+                        Some((*query_id, (*cell, min_dist_sq, max_dist_sq, *k)))
+                    },
+                );
 
-            let knn_queries_keyed =
-                knn_query_collection.map(|(query_id, point, k)| ((), (query_id, point, k)));
+            cell_distances.map(|_| ()).count().inspect(|count| {
+                println!("Cell distances size: {:?} records", count.0);
+            });
 
-            let objects_keyed = input_collection.map(|(obj_id, rect)| ((), (obj_id, rect)));
+            // base threshold is k-th smallest max_distance (theoretical minimum)
+            // plus a safety margin of largest cell spread to account for objects not at cell boundaries
+            let closest_cells = cell_distances.reduce(|_query_id, input, output| {
+                if let Some((_, _, _, k)) = input.first().map(|((_, _, _, k), _)| ((), (), (), *k))
+                {
+                    let cell_bounds: Vec<_> = input
+                        .iter()
+                        .map(|((cell, min_dist_sq, max_dist_sq, _k), diff)| {
+                            (*cell, *min_dist_sq, *max_dist_sq, *diff)
+                        })
+                        .collect();
 
-            let distances = knn_queries_keyed.join_core(
-                &objects_keyed.arrange_by_key(),
-                |_key, (query_id, point, k), (obj_id, rect)| {
-                    let distance_sq = point_to_rect_distance_squared(*point, rect);
-                    Some((*query_id, (*obj_id, distance_sq, *k)))
-                },
-            );
+                    // Find k-th smallest max_distance as base threshold
+                    let mut max_distances: Vec<_> = cell_bounds
+                        .iter()
+                        .map(|(_, _, max_dist, _)| *max_dist)
+                        .collect();
+                    max_distances.sort();
+
+                    let base_threshold = if max_distances.len() >= k {
+                        max_distances[k - 1] // k-th smallest max_distance
+                    } else {
+                        i64::MAX
+                    };
+
+                    // largest difference between max_dist and min_dist in any cell
+                    // this accounts for the fact that objects might not be at cell boundaries
+                    let max_cell_spread = cell_bounds
+                        .iter()
+                        .map(|(_, min_dist, max_dist, _)| max_dist - min_dist)
+                        .max()
+                        .unwrap_or(0);
+
+                    let threshold = base_threshold.saturating_add(max_cell_spread);
+
+                    // Include all cells whose min_dist <= threshold
+                    for (cell, min_dist, _max_dist, diff) in cell_bounds {
+                        if min_dist <= threshold {
+                            output.push((cell, diff));
+                        }
+                    }
+                }
+            });
+
+            closest_cells.map(|_| ()).count().inspect(|count| {
+                println!("Closest cells size: {:?} records", count.0);
+            });
+
+            // Only calculate actual object distances for objects in the closest cells
+            let distances = knn_query_collection
+                .map(|(query_id, point, k)| (query_id, (point, k)))
+                .join_core(
+                    &closest_cells
+                        .map(|(query_id, cell)| (query_id, cell))
+                        .arrange_by_key(),
+                    |query_id, (point, k), cell| Some((*query_id, (*cell, *point, *k))),
+                )
+                .map(|(query_id, (cell, point, k))| (cell, (query_id, point, k)))
+                .join_core(
+                    &by_cell,
+                    |_cell, (query_id, point, k), (object_id, object_rect)| {
+                        let actual_dist_sq = point_to_rect_distance_squared(*point, object_rect);
+                        Some((*query_id, (*object_id, actual_dist_sq, *k)))
+                    },
+                );
+
+            distances.map(|_| ()).count().inspect(|count| {
+                println!("Distances size: {:?} records", count.0);
+            });
 
             // Group by query and select top-k
             let knn_results_first_pass = distances
