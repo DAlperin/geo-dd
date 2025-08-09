@@ -24,22 +24,6 @@ struct CellKey {
     y: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Eq, PartialOrd, Ord)]
-struct KnnQuery {
-    query_id: u64,
-    point: (i64, i64),
-    k: usize,
-    search_radius: i64,
-}
-
-// Distance calculation result for KNN
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Eq, PartialOrd, Ord)]
-struct DistanceResult {
-    query_id: u64,
-    object_id: u64,
-    distance_squared: i64,
-}
-
 impl Rect {
     fn intersects(&self, other: &Rect) -> bool {
         !(self.max_x <= other.min_x
@@ -388,10 +372,6 @@ fn main() {
                     },
                 );
 
-            distances.map(|_| ()).count().inspect(|count| {
-                println!("Distances size: {:?} records", count.0);
-            });
-
             // Group by query and select top-k
             let knn_results_first_pass = distances
                 .reduce(|_query_id, input, output| {
@@ -463,6 +443,33 @@ fn main() {
                     min_y: 10,
                     max_x: 2,
                     max_y: 12,
+                },
+            ),
+            (
+                6,
+                Rect {
+                    min_x: 12,
+                    min_y: 12,
+                    max_x: 14,
+                    max_y: 14,
+                },
+            ),
+            (
+                7,
+                Rect {
+                    min_x: 100,
+                    min_y: 100,
+                    max_x: 102,
+                    max_y: 102,
+                },
+            ),
+            (
+                8,
+                Rect {
+                    min_x: 101,
+                    min_y: 101,
+                    max_x: 103,
+                    max_y: 103,
                 },
             ),
         ];
@@ -722,13 +729,6 @@ mod tests {
                 p
             );
         }
-
-        println!(
-            "Cover for rect {:?} spans {} cells: {:?}",
-            r,
-            cells.len(),
-            cells
-        );
 
         // Every emitted cell must intersect the rect.
         for c in &cells {
