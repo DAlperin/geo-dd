@@ -235,6 +235,51 @@ fn cell_distance_bounds(query_point: (i64, i64), cell: CellKey) -> (i64, i64) {
 type ObjectId = u64;
 type QueryId = u64;
 
+// Manual computation functions for comparison
+fn compute_range_query_results(
+    objects: &[(ObjectId, Rect)],
+    queries: &[(QueryId, Rect)],
+) -> Vec<(QueryId, ObjectId)> {
+    let mut results = Vec::new();
+    for &(query_id, query_rect) in queries {
+        for &(object_id, object_rect) in objects {
+            if query_rect.intersects(&object_rect) {
+                results.push((query_id, object_id));
+            }
+        }
+    }
+    results.sort();
+    results
+}
+
+fn compute_knn_query_results(
+    objects: &[(ObjectId, Rect)],
+    knn_queries: &[(QueryId, (i64, i64), usize)],
+) -> Vec<(QueryId, ObjectId, i64)> {
+    let mut results = Vec::new();
+
+    for &(query_id, query_point, k) in knn_queries {
+        let mut distances: Vec<(ObjectId, i64)> = objects
+            .iter()
+            .map(|&(object_id, object_rect)| {
+                let dist_sq = point_to_rect_distance_squared(query_point, &object_rect);
+                (object_id, dist_sq)
+            })
+            .collect();
+
+        // Sort by distance and take top k
+        distances.sort_by_key(|(_, dist)| *dist);
+        distances.truncate(k);
+
+        for (object_id, dist_sq) in distances {
+            results.push((query_id, object_id, dist_sq));
+        }
+    }
+
+    results.sort();
+    results
+}
+
 fn main() {
     timely::execute_from_args(std::env::args(), move |worker| {
         let mut geo_input = InputSession::<i64, _, _>::new();
@@ -255,7 +300,13 @@ fn main() {
                 println!("Covered collection size: {:?} records", count.0);
             });
 
-            let by_cell = covered.arrange_by_key();
+            let covered_with_ancestors = covered.flat_map(|(cell, (object_id, rect))| {
+                cell_ancestors(cell)
+                    .into_iter()
+                    .map(move |ancestor| (ancestor, (object_id, rect)))
+            });
+
+            let by_cell = covered_with_ancestors.arrange_by_key();
 
             let query_cells = query_collection.flat_map(|(query_id, rect)| {
                 dyadic_cover(rect)
@@ -292,7 +343,7 @@ fn main() {
             let cell_distances = knn_query_collection
                 .map(|(query_id, point, k)| ((), (query_id, point, k)))
                 .join_core(
-                    &covered
+                    &covered_with_ancestors
                         .map(|(cell, _objects)| ((), cell))
                         .distinct()
                         .arrange_by_key(),
@@ -517,12 +568,32 @@ fn main() {
             ),
         ];
 
+        let knn_queries: Vec<(u64, (i64, i64), usize)> =
+            vec![(1, (3, 3), 2), (2, (15, 15), 3), (3, (8, 5), 2)];
+
+        // Manual computation for comparison (before moving data)
+        println!("\n=== Manual Computation Results ===");
+
+        // Range queries
+        let expected_range_results = compute_range_query_results(&objects, &queries);
+        println!("Expected range query results:");
+        for (query_id, object_id) in &expected_range_results {
+            println!("  Range Query {} -> Object {}", query_id, object_id);
+        }
+
+        // KNN queries
+        let expected_knn_results = compute_knn_query_results(&objects, &knn_queries);
+        println!("\nExpected KNN query results:");
+        for (query_id, object_id, dist_sq) in &expected_knn_results {
+            println!(
+                "  KNN Query {} -> Object {} (distance²={})",
+                query_id, object_id, dist_sq
+            );
+        }
+
         for (query_id, rect) in queries {
             query_input.insert((query_id, rect));
         }
-
-        let knn_queries: Vec<(u64, (i64, i64), usize)> =
-            vec![(1, (3, 3), 2), (2, (15, 15), 3), (3, (8, 5), 2)];
 
         for (query_id, point, k) in knn_queries {
             knn_query_input.insert((query_id, point, k));
@@ -543,6 +614,291 @@ fn main() {
 mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn test_manual_range_queries() {
+        let objects: Vec<(ObjectId, Rect)> = vec![
+            (
+                1,
+                Rect {
+                    min_x: 0,
+                    min_y: 0,
+                    max_x: 2,
+                    max_y: 2,
+                },
+            ),
+            (
+                2,
+                Rect {
+                    min_x: 10,
+                    min_y: 10,
+                    max_x: 12,
+                    max_y: 12,
+                },
+            ),
+            (
+                3,
+                Rect {
+                    min_x: 5,
+                    min_y: 0,
+                    max_x: 7,
+                    max_y: 2,
+                },
+            ),
+            (
+                4,
+                Rect {
+                    min_x: 20,
+                    min_y: 20,
+                    max_x: 22,
+                    max_y: 22,
+                },
+            ),
+            (
+                5,
+                Rect {
+                    min_x: 0,
+                    min_y: 10,
+                    max_x: 2,
+                    max_y: 12,
+                },
+            ),
+            (
+                6,
+                Rect {
+                    min_x: 12,
+                    min_y: 12,
+                    max_x: 14,
+                    max_y: 14,
+                },
+            ),
+            (
+                7,
+                Rect {
+                    min_x: 100,
+                    min_y: 100,
+                    max_x: 102,
+                    max_y: 102,
+                },
+            ),
+            (
+                8,
+                Rect {
+                    min_x: 101,
+                    min_y: 101,
+                    max_x: 103,
+                    max_y: 103,
+                },
+            ),
+        ];
+
+        let queries: Vec<(QueryId, Rect)> = vec![
+            (
+                1,
+                Rect {
+                    min_x: 1,
+                    min_y: 1,
+                    max_x: 3,
+                    max_y: 3,
+                },
+            ),
+            (
+                2,
+                Rect {
+                    min_x: 9,
+                    min_y: 9,
+                    max_x: 13,
+                    max_y: 13,
+                },
+            ),
+            (
+                3,
+                Rect {
+                    min_x: 4,
+                    min_y: -1,
+                    max_x: 8,
+                    max_y: 3,
+                },
+            ),
+            (
+                4,
+                Rect {
+                    min_x: 25,
+                    min_y: 25,
+                    max_x: 30,
+                    max_y: 30,
+                },
+            ),
+        ];
+
+        let expected = compute_range_query_results(&objects, &queries);
+
+        println!("Expected range query results:");
+        for (query_id, object_id) in &expected {
+            println!("  Query {} -> Object {}", query_id, object_id);
+        }
+
+        // Manual verification of some expected results:
+        // Query 1 (1,1,3,3) should intersect with:
+        //   - Object 1 (0,0,2,2) - intersects
+        //   - Object 3 (5,0,7,2) - does not intersect
+        assert!(expected.contains(&(1, 1))); // Query 1 hits Object 1
+        assert!(!expected.contains(&(1, 3))); // Query 1 should not hit Object 3
+
+        // Query 2 (9,9,13,13) should intersect with:
+        //   - Object 2 (10,10,12,12) - intersects
+        //   - Object 6 (12,12,14,14) - intersects at corner
+        assert!(expected.contains(&(2, 2))); // Query 2 hits Object 2
+        assert!(expected.contains(&(2, 6))); // Query 2 hits Object 6
+    }
+
+    #[test]
+    fn test_manual_knn_queries() {
+        let objects: Vec<(ObjectId, Rect)> = vec![
+            (
+                1,
+                Rect {
+                    min_x: 0,
+                    min_y: 0,
+                    max_x: 2,
+                    max_y: 2,
+                },
+            ),
+            (
+                2,
+                Rect {
+                    min_x: 10,
+                    min_y: 10,
+                    max_x: 12,
+                    max_y: 12,
+                },
+            ),
+            (
+                3,
+                Rect {
+                    min_x: 5,
+                    min_y: 0,
+                    max_x: 7,
+                    max_y: 2,
+                },
+            ),
+            (
+                4,
+                Rect {
+                    min_x: 20,
+                    min_y: 20,
+                    max_x: 22,
+                    max_y: 22,
+                },
+            ),
+            (
+                5,
+                Rect {
+                    min_x: 0,
+                    min_y: 10,
+                    max_x: 2,
+                    max_y: 12,
+                },
+            ),
+            (
+                6,
+                Rect {
+                    min_x: 12,
+                    min_y: 12,
+                    max_x: 14,
+                    max_y: 14,
+                },
+            ),
+            (
+                7,
+                Rect {
+                    min_x: 100,
+                    min_y: 100,
+                    max_x: 102,
+                    max_y: 102,
+                },
+            ),
+            (
+                8,
+                Rect {
+                    min_x: 101,
+                    min_y: 101,
+                    max_x: 103,
+                    max_y: 103,
+                },
+            ),
+        ];
+
+        let knn_queries: Vec<(QueryId, (i64, i64), usize)> = vec![
+            (1, (3, 3), 2),   // Point (3,3), k=2
+            (2, (15, 15), 3), // Point (15,15), k=3
+            (3, (8, 5), 2),   // Point (8,5), k=2
+        ];
+
+        let expected = compute_knn_query_results(&objects, &knn_queries);
+
+        println!("Expected KNN query results:");
+        for (query_id, object_id, dist_sq) in &expected {
+            println!(
+                "  Query {} -> Object {} (distance²={})",
+                query_id, object_id, dist_sq
+            );
+        }
+
+        // Manual verification for query 1: point (3,3), k=2
+        // Distance to object 1 (0,0,2,2): point (3,3) to rect -> min distance is (3-2)² + (3-2)² = 2
+        // Distance to object 3 (5,0,7,2): point (3,3) to rect -> min distance is (5-3)² + (3-2)² = 5
+        let query1_results: Vec<_> = expected.iter().filter(|(qid, _, _)| *qid == 1).collect();
+        assert_eq!(query1_results.len(), 2); // Should have exactly 2 results for k=2
+
+        // Check that we get the closest objects
+        let obj1_dist = point_to_rect_distance_squared(
+            (3, 3),
+            &Rect {
+                min_x: 0,
+                min_y: 0,
+                max_x: 2,
+                max_y: 2,
+            },
+        );
+        let obj3_dist = point_to_rect_distance_squared(
+            (3, 3),
+            &Rect {
+                min_x: 5,
+                min_y: 0,
+                max_x: 7,
+                max_y: 2,
+            },
+        );
+        println!(
+            "Query 1 distances: Object 1 = {}, Object 3 = {}",
+            obj1_dist, obj3_dist
+        );
+
+        assert!(expected.contains(&(1, 1, obj1_dist)));
+        assert!(expected.contains(&(1, 3, obj3_dist)));
+    }
+
+    #[test]
+    fn test_point_to_rect_distance() {
+        // Point inside rectangle
+        let rect = Rect {
+            min_x: 0,
+            min_y: 0,
+            max_x: 10,
+            max_y: 10,
+        };
+        assert_eq!(point_to_rect_distance_squared((5, 5), &rect), 0);
+
+        // Point to the right of rectangle
+        assert_eq!(point_to_rect_distance_squared((15, 5), &rect), 25); // (15-10)² = 25
+
+        // Point to the upper-right corner
+        assert_eq!(point_to_rect_distance_squared((15, 15), &rect), 50); // (15-10)² + (15-10)² = 50
+
+        // Point to the left of rectangle
+        assert_eq!(point_to_rect_distance_squared((-3, 5), &rect), 9); // (0-(-3))² = 9
+    }
 
     #[test]
     fn cover_aligned_unit_square() {
